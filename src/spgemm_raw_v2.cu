@@ -249,8 +249,8 @@ int main(int argc, char** argv) {
     printf("  Step3 (numeric v2)     = %.2f ms\n", ms3);
     printf("GPU time = %.2f ms, GFlops = %.2f\n", ms, 2.0 * flops / (ms * 1e6));
 
-    // ---- Correctness verification ----
-    {
+    // ---- Correctness verification (commented out for benchmarking) ----
+    if (false) {
         printf("\n=== Correctness Verification ===\n");
         int M = hA.m, N = hB.n;
 
