@@ -98,14 +98,17 @@ inline TileMatrix csr2tile(const HostCSR& csr) {
 
     // Step 1: count tiles per tile-row
     T.tile_ptr = (int*)calloc(T.tilem + 1, sizeof(int));
+    std::vector<char> flag(T.tilen, 0);
+    std::vector<int> touched(T.tilen);
     for (int bi = 0; bi < T.tilem; bi++) {
-        std::vector<char> flag(T.tilen, 0);
+        int ntouched = 0;
         int rstart = bi * TILE_SIZE;
         int rend = std::min(rstart + TILE_SIZE, T.m);
         for (int j = csr.row_ptr[rstart]; j < csr.row_ptr[rend]; j++) {
             int tc = csr.col_idx[j] / TILE_SIZE;
-            if (!flag[tc]) { flag[tc] = 1; T.tile_ptr[bi + 1]++; }
+            if (!flag[tc]) { flag[tc] = 1; touched[ntouched++] = tc; T.tile_ptr[bi + 1]++; }
         }
+        for (int k = 0; k < ntouched; k++) flag[touched[k]] = 0;
     }
     // Prefix sum
     for (int i = 0; i < T.tilem; i++) T.tile_ptr[i + 1] += T.tile_ptr[i];
@@ -116,10 +119,10 @@ inline TileMatrix csr2tile(const HostCSR& csr) {
     T.tile_nnz = (int*)calloc(T.numtile + 1, sizeof(int));
     T.tile_csr_Ptr = (unsigned char*)calloc(T.numtile * TILE_SIZE, sizeof(unsigned char));
 
+    std::vector<int> nnz_per_tc(T.tilen, 0);
+    std::vector<unsigned char> ptr_flat(T.tilen * TILE_SIZE, 0);
     for (int bi = 0; bi < T.tilem; bi++) {
-        std::vector<char> col_flag(T.tilen, 0);
-        std::vector<int> nnz_per_tc(T.tilen, 0);
-        std::vector<std::vector<unsigned char>> ptr_per_tc(T.tilen, std::vector<unsigned char>(TILE_SIZE, 0));
+        int ntouched = 0;
         int rstart = bi * TILE_SIZE;
         int rend = std::min(rstart + TILE_SIZE, T.m);
         int rowlen = rend - rstart;
@@ -127,19 +130,21 @@ inline TileMatrix csr2tile(const HostCSR& csr) {
         for (int ri = 0; ri < rowlen; ri++)
             for (int j = csr.row_ptr[rstart + ri]; j < csr.row_ptr[rstart + ri + 1]; j++) {
                 int tc = csr.col_idx[j] / TILE_SIZE;
-                col_flag[tc] = 1; nnz_per_tc[tc]++; ptr_per_tc[tc][ri]++;
+                if (!flag[tc]) { flag[tc] = 1; touched[ntouched++] = tc; }
+                nnz_per_tc[tc]++; ptr_flat[tc * TILE_SIZE + ri]++;
             }
 
-        int cnt = 0;
+        std::sort(touched.begin(), touched.begin() + ntouched);
         int base = T.tile_ptr[bi];
-        for (int tc = 0; tc < T.tilen; tc++) {
-            if (col_flag[tc]) {
-                T.tile_columnidx[base + cnt] = tc;
-                T.tile_nnz[base + cnt + 1] = nnz_per_tc[tc];
-                for (int ri = 0; ri < TILE_SIZE; ri++)
-                    T.tile_csr_Ptr[(base + cnt) * TILE_SIZE + ri] = ptr_per_tc[tc][ri];
-                cnt++;
-            }
+        for (int i = 0; i < ntouched; i++) {
+            int tc = touched[i];
+            T.tile_columnidx[base + i] = tc;
+            T.tile_nnz[base + i + 1] = nnz_per_tc[tc];
+            for (int ri = 0; ri < TILE_SIZE; ri++)
+                T.tile_csr_Ptr[(base + i) * TILE_SIZE + ri] = ptr_flat[tc * TILE_SIZE + ri];
+            // Clear
+            flag[tc] = 0; nnz_per_tc[tc] = 0;
+            memset(&ptr_flat[tc * TILE_SIZE], 0, TILE_SIZE);
         }
     }
 
@@ -158,6 +163,9 @@ inline TileMatrix csr2tile(const HostCSR& csr) {
     T.tile_csr_Col = (unsigned char*)calloc(T.nnz, sizeof(unsigned char));
     T.mask = (unsigned short*)calloc(T.numtile * TILE_SIZE, sizeof(unsigned short));
 
+    // Direct-mapped lookup: tile column -> local tile index within tile-row
+    std::vector<int> tc_to_ti(T.tilen, -1);
+
     for (int bi = 0; bi < T.tilem; bi++) {
         int rstart = bi * TILE_SIZE;
         int rend = std::min(rstart + TILE_SIZE, T.m);
@@ -165,24 +173,22 @@ inline TileMatrix csr2tile(const HostCSR& csr) {
         int ntiles = T.tile_ptr[bi + 1] - T.tile_ptr[bi];
         int tbase = T.tile_ptr[bi];
 
+        // Build direct lookup for this tile-row
+        for (int ti = 0; ti < ntiles; ti++)
+            tc_to_ti[T.tile_columnidx[tbase + ti]] = ti;
+
         std::vector<int> tile_count(ntiles, 0);
-        // Temp storage
         int max_nnz = T.tile_nnz[tbase + ntiles] - T.tile_nnz[tbase];
-        std::vector<unsigned char> tmp_col(max_nnz, 0);
-        std::vector<TVAL> tmp_val(max_nnz, 0);
+        std::vector<unsigned char> tmp_col(max_nnz);
+        std::vector<TVAL> tmp_val(max_nnz);
 
         for (int j = csr.row_ptr[rstart]; j < csr.row_ptr[rend]; j++) {
             int tc = csr.col_idx[j] / TILE_SIZE;
-            // Find which local tile
-            for (int ti = 0; ti < ntiles; ti++) {
-                if (T.tile_columnidx[tbase + ti] == tc) {
-                    int pre = T.tile_nnz[tbase + ti] - T.tile_nnz[tbase];
-                    tmp_val[pre + tile_count[ti]] = csr.val[j];
-                    tmp_col[pre + tile_count[ti]] = (unsigned char)(csr.col_idx[j] - tc * TILE_SIZE);
-                    tile_count[ti]++;
-                    break;
-                }
-            }
+            int ti = tc_to_ti[tc];  // O(1) lookup instead of O(ntiles) search
+            int pre = T.tile_nnz[tbase + ti] - T.tile_nnz[tbase];
+            tmp_val[pre + tile_count[ti]] = csr.val[j];
+            tmp_col[pre + tile_count[ti]] = (unsigned char)(csr.col_idx[j] - tc * TILE_SIZE);
+            tile_count[ti]++;
         }
 
         // Now reorder into row-major within each tile and build packed col + mask
@@ -203,6 +209,8 @@ inline TileMatrix csr2tile(const HostCSR& csr) {
                     T.mask[tid * TILE_SIZE + ri] |= (unsigned short)(1 << (TILE_SIZE - 1 - colidx));
                 }
             }
+            // Clear direct lookup
+            tc_to_ti[T.tile_columnidx[tid]] = -1;
         }
     }
 
@@ -429,45 +437,60 @@ inline void build_csc_tiles(TileMatrix& B, const HostCSR& hB) {
         }
     // Count tiles per tile-column of B (= tile-row of BT)
     B.csc_tile_ptr = (int*)calloc(tilen + 1, sizeof(int));
-    for (int bti = 0; bti < tilen; bti++) {
+    {
         std::vector<char> flag(tilem, 0);
-        int rstart = bti * TILE_SIZE, rend = std::min(rstart + TILE_SIZE, n);
-        for (int ri = rstart; ri < rend; ri++)
-            for (int j = cscColPtr[ri]; j < cscColPtr[ri + 1]; j++) {
-                int tc = cscRowIdx[j] / TILE_SIZE;
-                if (!flag[tc]) { flag[tc] = 1; B.csc_tile_ptr[bti + 1]++; }
-            }
+        std::vector<int> touched(tilem);
+        for (int bti = 0; bti < tilen; bti++) {
+            int ntouched = 0;
+            int rstart = bti * TILE_SIZE, rend = std::min(rstart + TILE_SIZE, n);
+            for (int ri = rstart; ri < rend; ri++)
+                for (int j = cscColPtr[ri]; j < cscColPtr[ri + 1]; j++) {
+                    int tc = cscRowIdx[j] / TILE_SIZE;
+                    if (!flag[tc]) { flag[tc] = 1; touched[ntouched++] = tc; B.csc_tile_ptr[bti + 1]++; }
+                }
+            for (int k = 0; k < ntouched; k++) flag[touched[k]] = 0;
+        }
     }
     for (int i = 0; i < tilen; i++) B.csc_tile_ptr[i + 1] += B.csc_tile_ptr[i];
     int numtileBT = B.csc_tile_ptr[tilen];
     B.numtileB_csc = numtileBT;
     // Fill tile-row indices (B's tile-row for each CSC tile)
     B.csc_tile_rowidx = (int*)calloc(numtileBT, sizeof(int));
-    for (int bti = 0; bti < tilen; bti++) {
+    {
         std::vector<char> flag(tilem, 0);
-        int rstart = bti * TILE_SIZE, rend = std::min(rstart + TILE_SIZE, n);
-        int pos = B.csc_tile_ptr[bti];
-        for (int ri = rstart; ri < rend; ri++)
-            for (int j = cscColPtr[ri]; j < cscColPtr[ri + 1]; j++) {
-                int tc = cscRowIdx[j] / TILE_SIZE;
-                if (!flag[tc]) { flag[tc] = 1; B.csc_tile_rowidx[pos++] = tc; }
-            }
-        std::sort(B.csc_tile_rowidx + B.csc_tile_ptr[bti],
-                  B.csc_tile_rowidx + B.csc_tile_ptr[bti + 1]);
+        std::vector<int> touched(tilem);
+        for (int bti = 0; bti < tilen; bti++) {
+            int ntouched = 0;
+            int rstart = bti * TILE_SIZE, rend = std::min(rstart + TILE_SIZE, n);
+            int pos = B.csc_tile_ptr[bti];
+            for (int ri = rstart; ri < rend; ri++)
+                for (int j = cscColPtr[ri]; j < cscColPtr[ri + 1]; j++) {
+                    int tc = cscRowIdx[j] / TILE_SIZE;
+                    if (!flag[tc]) { flag[tc] = 1; touched[ntouched++] = tc; B.csc_tile_rowidx[pos++] = tc; }
+                }
+            std::sort(B.csc_tile_rowidx + B.csc_tile_ptr[bti],
+                      B.csc_tile_rowidx + B.csc_tile_ptr[bti + 1]);
+            for (int k = 0; k < ntouched; k++) flag[touched[k]] = 0;
+        }
     }
+    // Direct-mapped lookup: for each tile-column bti, map tile-row tc -> tile index
+    std::vector<int> tc_to_tidx(tilem, -1);
+
     // Count nnz per tile
     free(B.tile_nnz);
     B.tile_nnz = (int*)calloc(numtileBT + 1, sizeof(int));
     for (int bti = 0; bti < tilen; bti++) {
+        int ntiles_bti = B.csc_tile_ptr[bti + 1] - B.csc_tile_ptr[bti];
+        for (int ti = 0; ti < ntiles_bti; ti++)
+            tc_to_tidx[B.csc_tile_rowidx[B.csc_tile_ptr[bti] + ti]] = B.csc_tile_ptr[bti] + ti;
         int rstart = bti * TILE_SIZE, rend = std::min(rstart + TILE_SIZE, n);
         for (int ri = rstart; ri < rend; ri++)
             for (int j = cscColPtr[ri]; j < cscColPtr[ri + 1]; j++) {
-                int tc = cscRowIdx[j] / TILE_SIZE;
-                int* base = B.csc_tile_rowidx + B.csc_tile_ptr[bti];
-                int* endp = B.csc_tile_rowidx + B.csc_tile_ptr[bti + 1];
-                int tidx = B.csc_tile_ptr[bti] + (int)(std::lower_bound(base, endp, tc) - base);
+                int tidx = tc_to_tidx[cscRowIdx[j] / TILE_SIZE];
                 B.tile_nnz[tidx + 1]++;
             }
+        for (int ti = 0; ti < ntiles_bti; ti++)
+            tc_to_tidx[B.csc_tile_rowidx[B.csc_tile_ptr[bti] + ti]] = -1;
     }
     for (int i = 0; i < numtileBT; i++) B.tile_nnz[i + 1] += B.tile_nnz[i];
     int totalNnz = B.tile_nnz[numtileBT];
@@ -476,18 +499,21 @@ inline void build_csc_tiles(TileMatrix& B, const HostCSR& hB) {
     free(B.tile_csr_Val); B.tile_csr_Val = (TVAL*)calloc(totalNnz, sizeof(TVAL));
     free(B.tile_csr_Col); B.tile_csr_Col = (unsigned char*)calloc(totalNnz, sizeof(unsigned char));
     free(B.mask); B.mask = (unsigned short*)calloc(numtileBT * TILE_SIZE, sizeof(unsigned short));
-    // Count per-row nnz within each tile
+    // Count per-row nnz within each tile + fill values/cols/masks (single pass)
     std::vector<int> tileRowCnt(numtileBT * TILE_SIZE, 0);
     for (int bti = 0; bti < tilen; bti++) {
+        int ntiles_bti = B.csc_tile_ptr[bti + 1] - B.csc_tile_ptr[bti];
+        for (int ti = 0; ti < ntiles_bti; ti++)
+            tc_to_tidx[B.csc_tile_rowidx[B.csc_tile_ptr[bti] + ti]] = B.csc_tile_ptr[bti] + ti;
         int rstart = bti * TILE_SIZE, rend = std::min(rstart + TILE_SIZE, n);
         for (int ri = rstart; ri < rend; ri++)
             for (int j = cscColPtr[ri]; j < cscColPtr[ri + 1]; j++) {
-                int brow = cscRowIdx[j], tc = brow / TILE_SIZE, lr = brow % TILE_SIZE;
-                int* base = B.csc_tile_rowidx + B.csc_tile_ptr[bti];
-                int* endp = B.csc_tile_rowidx + B.csc_tile_ptr[bti + 1];
-                int tidx = B.csc_tile_ptr[bti] + (int)(std::lower_bound(base, endp, tc) - base);
+                int brow = cscRowIdx[j], lr = brow % TILE_SIZE;
+                int tidx = tc_to_tidx[brow / TILE_SIZE];
                 tileRowCnt[tidx * TILE_SIZE + lr]++;
             }
+        for (int ti = 0; ti < ntiles_bti; ti++)
+            tc_to_tidx[B.csc_tile_rowidx[B.csc_tile_ptr[bti] + ti]] = -1;
     }
     // Build tile_csr_Ptr (exclusive scan per tile)
     for (int t = 0; t < numtileBT; t++) {
@@ -500,20 +526,23 @@ inline void build_csc_tiles(TileMatrix& B, const HostCSR& hB) {
     // Fill values, col indices, masks
     std::vector<int> tileRowOff(numtileBT * TILE_SIZE, 0);
     for (int bti = 0; bti < tilen; bti++) {
+        int ntiles_bti = B.csc_tile_ptr[bti + 1] - B.csc_tile_ptr[bti];
+        for (int ti = 0; ti < ntiles_bti; ti++)
+            tc_to_tidx[B.csc_tile_rowidx[B.csc_tile_ptr[bti] + ti]] = B.csc_tile_ptr[bti] + ti;
         int rstart = bti * TILE_SIZE, rend = std::min(rstart + TILE_SIZE, n);
         for (int ri = rstart; ri < rend; ri++)
             for (int j = cscColPtr[ri]; j < cscColPtr[ri + 1]; j++) {
                 int brow = cscRowIdx[j], bcol = ri;
-                int lc = bcol % TILE_SIZE, tc = brow / TILE_SIZE, lr = brow % TILE_SIZE;
-                int* base = B.csc_tile_rowidx + B.csc_tile_ptr[bti];
-                int* endp = B.csc_tile_rowidx + B.csc_tile_ptr[bti + 1];
-                int tidx = B.csc_tile_ptr[bti] + (int)(std::lower_bound(base, endp, tc) - base);
+                int lc = bcol % TILE_SIZE, lr = brow % TILE_SIZE;
+                int tidx = tc_to_tidx[brow / TILE_SIZE];
                 int off = B.tile_nnz[tidx] + B.tile_csr_Ptr[tidx * TILE_SIZE + lr] + tileRowOff[tidx * TILE_SIZE + lr];
                 B.tile_csr_Val[off] = cscVal[j];
                 B.tile_csr_Col[off] = (unsigned char)lc;
                 B.mask[tidx * TILE_SIZE + lr] |= (unsigned short)(1 << (TILE_SIZE - 1 - lc));
                 tileRowOff[tidx * TILE_SIZE + lr]++;
             }
+        for (int ti = 0; ti < ntiles_bti; ti++)
+            tc_to_tidx[B.csc_tile_rowidx[B.csc_tile_ptr[bti] + ti]] = -1;
     }
     // Build within-tile CSC arrays: transpose each tile's CSR to CSC
     B.tile_csc_Ptr = (unsigned char*)calloc(numtileBT * TILE_SIZE, sizeof(unsigned char));
