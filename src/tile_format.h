@@ -10,7 +10,7 @@
 
 #define TILE_SIZE 16
 
-using TVAL = float;
+using TVAL = double;
 
 struct TileMatrix {
     int m, n, nnz;

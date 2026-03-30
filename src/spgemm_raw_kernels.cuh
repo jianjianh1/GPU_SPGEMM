@@ -265,15 +265,15 @@ __global__ void step2_build_ptrRowC_kernel(
 // ---- Step3: numeric — one half-warp per tile ----
 __global__ void step3_numeric_kernel(
     const int* __restrict__ tile_ptrA, const int* __restrict__ tile_colidxA,
-    const int* __restrict__ tile_nnzA, const float* __restrict__ tile_valA,
+    const int* __restrict__ tile_nnzA, const TVAL* __restrict__ tile_valA,
     const unsigned char* __restrict__ tile_colA, const unsigned char* __restrict__ tile_ptrRowA,
     const int* __restrict__ csc_tile_ptrB, const int* __restrict__ csc_tile_rowidxB,
-    const int* __restrict__ tile_nnzB, const float* __restrict__ tile_valB,
+    const int* __restrict__ tile_nnzB, const TVAL* __restrict__ tile_valB,
     const unsigned char* __restrict__ tile_colB, const unsigned char* __restrict__ tile_ptrRowB,
     const int* __restrict__ tile_rowidxC, const int* __restrict__ tile_colidxC,
     const int* __restrict__ tile_nnzC_prefix, const unsigned short* __restrict__ maskC,
     const unsigned char* __restrict__ ptrRowC,
-    float* __restrict__ tile_valC, unsigned char* __restrict__ tile_colC,
+    TVAL* __restrict__ tile_valC, unsigned char* __restrict__ tile_colC,
     const int* __restrict__ spec_cnt, const int* __restrict__ spec_off,
     const int* __restrict__ spec_posa, const int* __restrict__ spec_posb,
     int numtileC)
@@ -311,7 +311,7 @@ __global__ void step3_numeric_kernel(
     }
 
     // Register accumulator
-    float racc[TS];
+    TVAL racc[TS];
     for (int c = 0; c < TS; c++) racc[c] = 0.0f;
 
     // lambda to multiply two tiles
@@ -327,15 +327,15 @@ __global__ void step3_numeric_kernel(
         int aRowS = __ldg(&tile_ptrRowA[aidx * TS + row]);
         int aRowE = (row == TS-1) ? nnzAtot : (int)__ldg(&tile_ptrRowA[aidx * TS + row+1]);
         const unsigned char* __restrict__ cA = tile_colA + nnzAs;
-        const float* __restrict__ vA = tile_valA + nnzAs;
+        const TVAL* __restrict__ vA = tile_valA + nnzAs;
         const unsigned char* __restrict__ cB = tile_colB + nnzBs;
-        const float* __restrict__ vB = tile_valB + nnzBs;
+        const TVAL* __restrict__ vB = tile_valB + nnzBs;
         const unsigned char* __restrict__ pRB = tile_ptrRowB + bidx * TS;
 
         //for each item in row of K
         for (int a = aRowS; a < aRowE; a++) {
             int k = __ldg(&cA[a]) & 0xf;
-            float va = __ldg(&vA[a]);
+            TVAL va = __ldg(&vA[a]);
 
             //identify matching items in colB - start and end
             int bPs = __ldg(&pRB[k]);

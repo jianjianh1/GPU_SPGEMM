@@ -14,12 +14,12 @@
 
 struct TileDevPtrs {
     int *tile_ptr, *tile_colidx, *tile_nnz;
-    float *tile_val; unsigned char *tile_col, *tile_ptrRow;
+    TVAL *tile_val; unsigned char *tile_col, *tile_ptrRow;
     unsigned short *mask;
     int *csc_tile_ptr, *csc_tile_rowidx;
     // Within-tile CSC (for B v2)
     unsigned char *tile_csc_Ptr, *tile_csc_Row;
-    float *tile_csc_Val;
+    TVAL *tile_csc_Val;
 };
 
 TileDevPtrs upload_tiles(const TileMatrix& T, bool is_B) {
@@ -221,8 +221,8 @@ int main(int argc, char** argv) {
     float ms2; cudaEventElapsedTime(&ms2, ev0, ev1);
 
     // ---- Step 3: numeric (v2 kernel) ----
-    float *d_valC; unsigned char *d_colC;
-    cudaMalloc(&d_valC, nnzC * sizeof(float));
+    TVAL *d_valC; unsigned char *d_colC;
+    cudaMalloc(&d_valC, nnzC * sizeof(TVAL));
     cudaMalloc(&d_colC, nnzC * sizeof(unsigned char));
 
     cudaEventRecord(ev0);
@@ -257,15 +257,15 @@ int main(int argc, char** argv) {
         std::vector<int> h_tile_ptrC(tilemA + 1), h_rowidxC(numtileC), h_colidxC(numtileC);
         std::vector<int> h_tile_nnzC(numtileC + 1);
         std::vector<unsigned char> h_colC(nnzC);
-        std::vector<float> h_valC(nnzC);
+        std::vector<TVAL> h_valC(nnzC);
         cudaMemcpy(h_tile_ptrC.data(), d_tile_ptrC, (tilemA+1)*sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_rowidxC.data(), d_rowidxC, numtileC*sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_colidxC.data(), d_colidxC, numtileC*sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_tile_nnzC.data(), d_tile_nnzC, (numtileC+1)*sizeof(int), cudaMemcpyDeviceToHost);
         cudaMemcpy(h_colC.data(), d_colC, nnzC*sizeof(unsigned char), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_valC.data(), d_valC, nnzC*sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_valC.data(), d_valC, nnzC*sizeof(TVAL), cudaMemcpyDeviceToHost);
 
-        std::vector<std::vector<std::pair<int,float>>> gpu_C(M);
+        std::vector<std::vector<std::pair<int,TVAL>>> gpu_C(M);
         for (int ti = 0; ti < numtileC; ti++) {
             int tr = h_rowidxC[ti], tc = h_colidxC[ti];
             int base_nnz = h_tile_nnzC[ti];
@@ -298,7 +298,7 @@ int main(int argc, char** argv) {
             cols.clear();
             for (int ja = hA.row_ptr[i]; ja < hA.row_ptr[i+1]; ja++) {
                 int k = hA.col_idx[ja];
-                float va = hA.val[ja];
+                TVAL va = hA.val[ja];
                 for (int jb = hB.row_ptr[k]; jb < hB.row_ptr[k+1]; jb++) {
                     int c = hB.col_idx[jb];
                     if (!used[c]) { used[c] = true; cols.push_back(c); }
